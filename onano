@@ -1,0 +1,362 @@
+#!/bin/bash
+
+# redirect debug
+#[[ -n "DEBUG" ]] && exec 2> debug.log
+#
+
+file="${1:-New Buffer}"
+
+readonly VERSION="onano 0.1.0"
+readonly rev="\033[30;47m"
+readonly rst="\033[0m"
+
+declare -i lines=$(tput lines)
+declare -i cols=$(tput cols)
+declare -i buf_first_visible=0
+declare -i VIEW_TOP=2
+declare -i BOT_HEIGHT=2
+declare -i VIEW_BOT=$((lines - VIEW_TOP - BOT_HEIGHT))
+declare -i view_height=$((VIEW_BOT - VIEW_TOP + 1))
+declare -i scr_line=$((VIEW_TOP))
+declare -i scr_col=1
+declare -a buffer
+declare -A sel
+
+prompt() {
+	msg=${1:-"Input"} 
+	pre=${2:-""}
+	printf "\e[r\e[%s;0H\e[1;7m%*s\r%s: " $((VIEW_BOT + 2)) $((cols)) "" "$msg"
+	stty echo
+	read -r -e -i "${pre}"
+	printf "\e[0m\e[u"
+	stty -echo
+}
+
+mark() {
+	local xl="${1}"
+	local xc="${2}"
+	sel["beg"]="${xl}:${xc}"
+}
+
+get_terminal_size() {
+	lines=$(tput lines)
+	cols=$(tput cols)
+}
+
+setup_terminal() {
+	buf_first_visible=0
+	VIEW_TOP=2
+	VIEW_BOT=$((lines - VIEW_TOP - BOT_HEIGHT))
+	view_height=$((VIEW_BOT - VIEW_TOP + 1))
+	printf '\e[?1049h\e[?7l\e[2J\e[%s;%sr' $((VIEW_TOP)) $((VIEW_BOT-2))
+	stty -echo
+}
+
+reset_terminal() {
+		printf '\e[?7h\e[?25h\e[2J\e[;r\e[?1049l'
+		stty echo
+}
+
+sync_cursor() {
+	printf "\e[%s;%sH" $((scr_line)) $((scr_col))
+}
+
+debug() {
+	par="${*:-''}"
+	printf -- "$par\n" >> /dev/stderr
+	printf -- "\e[s\e[1;%dH%s\e[u" $((cols - 10)) "$par"
+	#sleep 0.1
+}
+
+redraw_topbar() {
+	printf "\e[0;0H\e[0K${rev}$(center "$file")\r  ${VERSION}$rst"
+}
+
+redraw_menu () {
+	menu=(
+		"^G:Get Help"
+		"^O:WriteOut"
+		"^W:Where Is"
+		"^K:Cut"
+		"^T:Execute"
+		"^C:Location"
+		"M-U:Undo"
+		"M-A:Set Mark"
+	)
+	w=11
+	many=$((cols / (w + 5) ))
+	printf "\e[%s;0H" $((lines - 1))
+	for m in "${menu[@]::many}" ; do printf "\e[1;7m%2s\e[0m %-*s " "${m%%:*}" $w "${m##*:}" ; done
+
+	menu=(
+		"^X:eXit"
+		"^R:Read File"
+		"^\:Replace"
+		"^U:Paste"
+		"^J:Justify"
+		"^/:Go To Line"
+		"M-E:Redo"
+		"M-6:Copy"
+	)
+	printf "\e[%s;0H" $((lines))
+	for m in "${menu[@]::many}" ; do printf "\e[1;7m%2s\e[0m %-*s " "${m%%:*}" $w "${m##*:}" ; done
+}
+
+center() {
+	local arg="${1}"
+	local len=$(( (COLUMNS + ${#arg}) / 2 ))
+	printf "%*s%*s%*s\n" $len "$arg" $len ""
+}
+
+set_scroll_area() {
+	printf "\e[%s;%sr" $((VIEW_TOP)) $((lines - BOT_HEIGHT))
+}
+
+trap ':' SIGINT
+trap 'reset_terminal' EXIT
+trap 'reset_terminal; get_terminal_size; setup_terminal; redraw' SIGWINCH
+
+redraw() {
+	redraw_topbar
+	redraw_menu
+	set_scroll_area
+	redraw_text $buf_first_visible
+}
+
+read_file () {
+	[[ -n "$1" ]] || buffer=( )
+	[[ -r "$1" ]] && mapfile -t buffer < <(cat "$1")
+}
+
+kmove () {
+	key="${1}"
+	mod="${2:-'n'}"
+	rep=1
+
+	[[ $mod =~ s && ! "$sel_line" ]] && mark "$cl" "$cc"
+	[[ $mod =~ n &&   "$sel_line" ]] && unset sel["beg"]
+	[[ $mod =~ c ]] && rep=5
+	#[[ $mod =~ a ]] && :
+	case $key in
+		"A") move "up"    $rep ;;
+		"B") move "down"  $rep ;;
+		"C") move "right" $rep ;;
+		"D") move "left"  $rep ;;
+	esac
+}
+
+move () {
+	arg="${1}"
+	rep="${2:-1}"
+
+	for ((i=0; i<rep; i++)) ; do
+		case "$arg" in
+			"up")
+				if (( scr_line == 2 )); then
+					if (( buf_first_visible > 0)); then
+						(( buf_first_visible-- ))
+					fi
+				else
+					(( scr_line--, scr_col = scr_col>pll + 1 ? pll + 1 : scr_col ))
+				fi ;;
+			"down")
+				if (( scr_line <= bufsize )) ; then
+					if (( scr_line > view_height + BOT_HEIGHT )); then
+						if (( scr_line + buf_first_visible <= bufsize + 1 )); then
+							(( buf_first_visible++ ))
+						fi
+					else
+						(( scr_line++, scr_col = scr_col>nll + 1 ? nll + 1 : scr_col ))
+					fi
+				fi ;;
+			"left")
+				if (( scr_col > 1)); then
+					(( scr_col-- ))
+				else #XXX
+					(( scr_line > VIEW_TOP )) && (( scr_line--, scr_col = pll + 1 ))
+				fi ;;
+
+			"right")
+				if (( scr_col <= cll)); then
+					(( scr_col++ ))
+				else
+					(( scr_line < bufsize )) && (( scr_line++, scr_col=1 ))
+				fi ;;
+			*) : ;;
+		esac
+	done
+	sync_cursor
+}
+
+page () {
+	dir="${1:-down}"
+	move "$dir" $((view_height/2))
+	scr_col=1
+}
+
+redraw_text () {
+	first=${1:-0}
+	sel_line=${sel["beg"]%%:*}
+	dot_line=${sel["dot"]%%:*}
+	local beg end
+	# XXX
+	[[ $sel_line ]] &&
+		(( sel_line < dot_line )) && {
+			(( sel_line < first )) && sel_line=$first
+			beg=$(( sel_line - first ))
+			end=$(( dot_line - first ))
+		} || {
+			(( dot_line < first )) && dot_line=$first
+			beg=$(( dot_line - first ))
+			end=$(( sel_line - first ))
+		}
+
+	printf "\e[%s;0H\e[1049l" $((BOT_HEIGHT))
+	for (( x=0;x<VIEW_BOT+VIEW_TOP-1; x++ )); do
+		local c=$((x + VIEW_TOP))
+		[[ $sel_line ]] && (( c - BOT_HEIGHT == beg )) && printf "\e[33;2;7m"
+		printf "\e[%d;0H\e[2K\r" $c
+		printf "\e[%d;0H%s" $c "${buffer[first+x]}"
+		[[ $sel_line ]] && (( c - BOT_HEIGHT == end )) && printf "\e[0m"
+	done
+	printf "\e[%s;0H\e[1049h" $((VIEW_TOP))
+}
+
+setup_terminal
+read_file "$file"
+redraw
+sync_cursor
+
+while : ; do
+	IFS= read -s -r -n 1 key
+
+	case "$key" in
+		"") # Enter
+			buffer=( "${buffer[@]::cl}" "${buffer[cl]::cc}" "${buffer[cl]:cc}" "${buffer[@]:nl}" )
+			(( scr_line++ ))
+			scr_col=1
+			;;
+		$'\t') # Tab
+			buffer[cl]="${buffer[cl]::cc} ${buffer[cl]:cc}"
+			(( scr_col+=4 ))
+			;;
+		$'\177') # Backspace
+			if ((cc > 0 )); then
+				buffer[cl]="${buffer[cl]::cc-1}${buffer[cl]:cc}"
+				move "left"
+			else
+				if (( cll == 0 )); then
+					buffer=( "${buffer[@]::cl}" "${buffer[@]:nl}" )
+				else
+					(( cl >= 0 )) && buffer=( "${buffer[@]::pl}" "${buffer[pl]}${buffer[cl]}" "${buffer[@]:nl}" )
+				fi
+				(( cl >= 0 )) &&  (( scr_col = pll + 1, scr_line-- ))
+			fi ;;
+		$'\013') # ^K Cut Text
+			s=$(( ${sel["beg"]%%:*} ))
+			d=$(( ${sel["dot"]%%:*} ))
+			(( s > d )) &&  { t=$d ; d=$s; s=$t; }
+			[[ "$s" ]] && (( s < d )) && cnt=$((1 + d - s )) || cnt=$((1 + s - d))
+			(( cnt < 1 )) && cnt=1
+			clipboard=( "${buffer[@]:s:cnt}" )
+			buffer=( "${buffer[@]::s}" "${buffer[@]:d+1}" )
+			unset sel["beg"]
+			scr_line=$((s + VIEW_TOP - buf_first_visible))
+			;;
+		$'\014') # ^L "refresh"
+			setup_terminal; redraw;;
+		$'\025') # ^U UnCut Text
+			buffer=( "${buffer[@]::cl}" "${clipboard[@]}" "${buffer[@]:nl-1}" )
+			(( scr_line+= ${#clipboard[@]} ))
+			;;
+		$'\022') # Read File
+			prompt "File to insert [from ./]"
+			[[ -n "$REPLY" ]] && mapfile -t insfile < <(cat "$REPLY")
+			buffer=( "${buffer[@]::cl}" "${insfile[@]}" "${buffer[@]:nl-1}" )
+			(( scr_line+= ${#insfile[@]} ))
+			unset insfile
+			;;
+
+		$'\026') page "down";; # ^V Next Page
+		$'\031') page "up"  ;; # ^Y Prev Page
+
+		$'\017') # Write ^Out
+			writebuf=( "${buffer[@]}" )
+			[[ "$file" =~ 'New Buffer' ]] && newfile="" || newfile="$file"
+			prompt "File Name to Write" "$newfile"
+			[[ -n "$REPLY" ]] && file="$REPLY"
+			printf "%s\n" "${writebuf[@]}" > "$file"
+			redraw_topbar
+			;;
+
+		$'\030') exit 0 ;; #^X  XXX
+
+		$'\034') : ;; #^\ XXX
+		$'\003') : ;; #^C XXX
+		$'\027') : ;; #^W XXX
+
+		$'\e') IFS= read -s -r -n 1 esc_key # Esc
+			case $esc_key in
+				"[") IFS= read -s -r -n 1 esc_key2 # Esc
+					case $esc_key2 in
+						"A"|"B"|"C"|"D") kmove $esc_key2 "n" ;;
+						"1") IFS= read -s -r -n 1 esc_key3 # Esc
+							case $esc_key3 in
+								";") IFS= read -s -r -n 1 esc_key4 # Esc
+										case $esc_key4 in
+											"2") mode="s" #Shift
+													IFS= read -s -r -n 1 esc_key5 # Esc
+													kmove "$esc_key5" "$mode"
+													;;
+											"3") mode="a" # Alt
+													IFS= read -s -r -n 1 esc_key5 # Esc
+													kmove "$esc_key5" "$mode"
+													;;
+											"5") mode="c" # Control
+													IFS= read -s -r -n 1 esc_key5 # Esc
+													kmove "$esc_key5" "$mode"
+													;;
+											"6") mode="cs" # Shift+Control
+													[[ ! "$sel_line" ]] && mark "$cl" "$cc"
+													IFS= read -s -r -n 1 esc_key5 # Esc
+													kmove "$esc_key5" "$mode"
+													;;
+										esac ;;
+							esac ;;
+						"5") IFS= read -s -r -n 1 esc_key3 # Esc
+							[[ "$esc_key3" == "~" ]] && page "up" ;;
+						"6") IFS= read -s -r -n 1 esc_key3 # Esc
+							[[ "$esc_key3" == "~" ]] && page "down" ;;
+					esac ;;
+
+				"a"|".") mark "$cl" "$cc" ;; # Alt-A/Alt-period to start selection
+			esac ;;
+
+		*) # Add regular character at cursor position
+			if (( cc <= 0 && cll < 1)); then
+				cc=1
+				buffer[cl]="$key"
+				(( scr_col = cll + 1 ))
+			else 
+				buffer[cl]="${buffer[cl]::cc}$key${buffer[cl]:cc}"
+			fi
+			(( scr_col++ ))
+			;;
+	esac
+
+	bufsize=${#buffer[@]}
+	cc=$(( scr_col - 1 ))
+	cl=$(( scr_line + buf_first_visible - VIEW_TOP ))
+	pl=$(( cl > 0 ? cl - 1 : 0 ))
+	nl=$(( cl < bufsize ? cl + 1 : cl ))
+	cll=${#buffer[cl]}
+	pll=${#buffer[pl]}
+	nll=${#buffer[nl]}
+	sel["dot"]="${cl}:${cc}"
+
+	(( buf_first_visible > bufsize )) && buf_first_visible=$bufsize
+	(( buf_first_visible < 0 )) && buf_first_visible=0
+	redraw_text $buf_first_visible
+	sync_cursor
+done
+# vim: ts=4 sw=4 noexpandtab ft=bash :
